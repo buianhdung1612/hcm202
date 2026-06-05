@@ -27,7 +27,7 @@ let game = {
   hasRevivedThisRound: false
 };
 
-const QUESTION_TIME_LIMIT = 30; // 30 seconds per question
+const QUESTION_TIME_LIMIT = 20; // 20 seconds per question
 
 // Broadcast global status (whether a host exists)
 const broadcastHostStatus = () => {
@@ -41,14 +41,19 @@ io.on('connection', (socket) => {
   socket.emit('host_status', { hasHost: game.hostId !== null });
 
   // HOST: Bấm tạo phòng / làm host
-  socket.on('become_host', () => {
+  socket.on('become_host', (data) => {
+    const password = data?.password;
+    if (password !== 'admin123') {
+      socket.emit('host_rejected', 'Sai mật khẩu Host!');
+      return;
+    }
     if (game.hostId !== null && game.hostId !== socket.id) {
       socket.emit('host_rejected', 'Đã có Host cho game này. Bạn chỉ có thể làm Player.');
       return;
     }
     
     game.hostId = socket.id;
-    socket.emit('host_accepted');
+    socket.emit('host_accepted', { isRevivalLocked: game.isRevivalLocked });
     broadcastHostStatus();
     console.log(`Host joined: ${socket.id}`);
   });
@@ -108,10 +113,26 @@ io.on('connection', (socket) => {
 
       game.timer = setInterval(() => {
         game.timeRemaining--;
+        io.emit('timer_tick', { timeRemaining: game.timeRemaining });
         if (game.timeRemaining <= 0) {
           clearInterval(game.timer);
           game.timer = null;
+
+          // Auto-kill: trong Final Round, ai còn alive mà chưa nộp bài thì chết
+          if (game.isRevivalLocked) {
+            for (let pid in game.players) {
+              const p = game.players[pid];
+              if (p.status === 'Alive' && !p.lastAnswer) {
+                p.status = 'Dead';
+                io.to(pid).emit('you_are_dead');
+              }
+            }
+          }
+
           io.emit('question_timeout');
+          if (game.hostId) {
+            io.to(game.hostId).emit('player_status_updated', Object.values(game.players));
+          }
         }
       }, 1000);
     }
@@ -128,6 +149,47 @@ io.on('connection', (socket) => {
     }
   });
 
+  // HOST: Kết thúc trò chơi - người alive cuối cùng thắng
+  socket.on('end_game', () => {
+    if (game.hostId === socket.id) {
+      if (game.timer) clearInterval(game.timer);
+      game.timer = null;
+
+      const alivePlayers = Object.values(game.players).filter(p => p.status === 'Alive');
+      const winners = alivePlayers; // Chết hết thì không có ai win
+
+      io.emit('game_over', {
+        winners: winners.map(p => p.name),
+        players: Object.values(game.players)
+      });
+      console.log(`Game over! Winners: ${winners.map(p => p.name).join(', ')}`);
+    }
+  });
+
+  // HOST: Tua nhanh - kết thúc timer ngay lập tức
+  socket.on('skip_question', () => {
+    if (game.hostId === socket.id && game.timer) {
+      clearInterval(game.timer);
+      game.timer = null;
+
+      // Auto-kill trong Final Round
+      if (game.isRevivalLocked) {
+        for (let pid in game.players) {
+          const p = game.players[pid];
+          if (p.status === 'Alive' && !p.lastAnswer) {
+            p.status = 'Dead';
+            io.to(pid).emit('you_are_dead');
+          }
+        }
+      }
+
+      io.emit('question_timeout');
+      if (game.hostId) {
+        io.to(game.hostId).emit('player_status_updated', Object.values(game.players));
+      }
+    }
+  });
+
   // PLAYER: Gửi câu trả lời
   socket.on('submit_answer', ({ answer }) => {
     if (game.players[socket.id]) {
@@ -135,13 +197,20 @@ io.on('connection', (socket) => {
       const isCorrect = answer === game.currentCorrectAnswer;
       player.lastAnswer = answer;
       
-      // Nếu Vòng Chung Kết (isRevivalLocked = true), tất cả người chơi đều trả lời ẩn danh trên web
+      // Vòng Chung Kết: trả kết quả ngay, sai thì chết
       if (game.isRevivalLocked) {
-         socket.emit('answer_submitted_anonymous'); // Chỉ xác nhận đã nộp bài, không báo kết quả ngay
-         if (game.hostId) {
-             io.to(game.hostId).emit('player_status_updated', Object.values(game.players));
-         }
-         return;
+        socket.emit('answer_result', { isCorrect, streak: player.streak || 0 });
+
+        if (!isCorrect && player.status === 'Alive') {
+          // Trả lời sai → chết ngay
+          player.status = 'Dead';
+          socket.emit('you_are_dead');
+        }
+
+        if (game.hostId) {
+          io.to(game.hostId).emit('player_status_updated', Object.values(game.players));
+        }
+        return;
       }
 
       // Vòng loại: Người chết trả lời đúng và nhanh nhất được hồi sinh
@@ -175,14 +244,23 @@ io.on('connection', (socket) => {
     console.log('User disconnected:', socket.id);
     
     if (game.hostId === socket.id) {
-      console.log("Host disconnected, resetting game state");
-      // Reset game
-      game.hostId = null;
-      game.isGameStarted = false;
+      console.log("Host disconnected, resetting FULL game state");
       if (game.timer) clearInterval(game.timer);
-      game.timer = null;
+      // ✅ Reset TOÀN BỘ game về trạng thái ban đầu
+      game = {
+        hostId: null,
+        players: {},
+        isGameStarted: false,
+        currentQuestionIndex: -1,
+        currentCorrectAnswer: null,
+        timer: null,
+        timeRemaining: 0,
+        isRevivalLocked: false,
+        hasRevivedThisRound: false
+      };
       broadcastHostStatus();
-      io.emit('host_disconnected'); // Báo cho người chơi biết Host đã thoát
+      io.emit('revival_locked_status', { isLocked: false }); // Thông báo reset vòng chung kết cho tất cả player
+      io.emit('host_disconnected');
     } else if (game.players[socket.id]) {
       delete game.players[socket.id];
       if (game.hostId) {
