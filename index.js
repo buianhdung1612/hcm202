@@ -105,8 +105,12 @@ io.on('connection', (socket) => {
       
       // Reset player answers for the new round
       game.hasRevivedThisRound = false;
+      game.aliveAtStartOfTurn = [];
       for (let pid in game.players) {
         game.players[pid].lastAnswer = null;
+        if (game.players[pid].status === 'Alive') {
+          game.aliveAtStartOfTurn.push(pid);
+        }
       }
       
       io.emit('new_question', { questionIndex, questionData, timeLimit: QUESTION_TIME_LIMIT });
@@ -117,26 +121,40 @@ io.on('connection', (socket) => {
         if (game.timeRemaining <= 0) {
           clearInterval(game.timer);
           game.timer = null;
-
-          // Auto-kill: trong Final Round, ai còn alive mà chưa nộp bài thì chết
-          if (game.isRevivalLocked) {
-            for (let pid in game.players) {
-              const p = game.players[pid];
-              if (p.status === 'Alive' && !p.lastAnswer) {
-                p.status = 'Dead';
-                io.to(pid).emit('you_are_dead');
-              }
-            }
-          }
-
-          io.emit('question_timeout');
-          if (game.hostId) {
-            io.to(game.hostId).emit('player_status_updated', Object.values(game.players));
-          }
+          handleEndOfQuestion(game, io);
         }
       }, 1000);
     }
   });
+
+  function handleEndOfQuestion(game, io) {
+    // Auto-kill: trong Final Round, ai còn alive mà chưa nộp bài thì chết
+    if (game.isRevivalLocked) {
+      for (let pid in game.players) {
+        const p = game.players[pid];
+        if (p.status === 'Alive' && !p.lastAnswer) {
+          p.status = 'Dead';
+          io.to(pid).emit('you_are_dead');
+        }
+      }
+    }
+
+    // Nếu tất cả người chơi đều chết trong/kết thúc lượt này, hồi sinh những người sống ở đầu lượt
+    const alivePlayers = Object.values(game.players).filter(p => p.status === 'Alive');
+    if (alivePlayers.length === 0 && game.aliveAtStartOfTurn && game.aliveAtStartOfTurn.length > 0) {
+      game.aliveAtStartOfTurn.forEach(pid => {
+        if (game.players[pid]) {
+          game.players[pid].status = 'Alive';
+          io.to(pid).emit('you_are_revived');
+        }
+      });
+    }
+
+    io.emit('question_timeout');
+    if (game.hostId) {
+      io.to(game.hostId).emit('player_status_updated', Object.values(game.players));
+    }
+  }
 
   // HOST: Đánh dấu 1 người chơi là Dead (vì sai offline)
   socket.on('kill_player', ({ playerId }) => {
@@ -171,22 +189,7 @@ io.on('connection', (socket) => {
     if (game.hostId === socket.id && game.timer) {
       clearInterval(game.timer);
       game.timer = null;
-
-      // Auto-kill trong Final Round
-      if (game.isRevivalLocked) {
-        for (let pid in game.players) {
-          const p = game.players[pid];
-          if (p.status === 'Alive' && !p.lastAnswer) {
-            p.status = 'Dead';
-            io.to(pid).emit('you_are_dead');
-          }
-        }
-      }
-
-      io.emit('question_timeout');
-      if (game.hostId) {
-        io.to(game.hostId).emit('player_status_updated', Object.values(game.players));
-      }
+      handleEndOfQuestion(game, io);
     }
   });
 
